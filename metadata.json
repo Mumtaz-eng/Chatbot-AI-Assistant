@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Copy of Copy of Copy of Gemini Chat 02-dec",
+  "description": "A premium, real-time AI chat interface powered by the latest Gemini models with streaming responses and markdown support.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

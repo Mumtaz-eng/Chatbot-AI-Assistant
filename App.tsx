@@ -1,0 +1,350 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Menu, Volume2, VolumeX, Sparkles } from 'lucide-react';
+import ChatBubble from './components/ChatBubble';
+import ChatInput from './components/ChatInput';
+import Sidebar from './components/Sidebar';
+import { streamGeminiResponse } from './services/geminiService';
+import { saveMemory } from './services/memoryService';
+import { getSessions, saveSession, deleteSession } from './services/chatHistoryService';
+import { checkDueTasks } from './services/taskService';
+import { ChatMessage, Role, ChatAttachment, UserProfile, ChatSession } from './types';
+import { DEFAULT_MODEL_ID } from './constants';
+
+const generateId = () => Math.random().toString(36).substring(2, 9) + Date.now().toString(36);
+
+const App: React.FC = () => {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [currentModelId, setCurrentModelId] = useState(DEFAULT_MODEL_ID);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [user, setUser] = useState<UserProfile | undefined>(undefined);
+  const [isVoiceMode, setIsVoiceMode] = useState(false);
+  
+  // History State
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Load history on mount
+  useEffect(() => {
+    setSessions(getSessions());
+  }, []);
+
+  // Task Reminder Check Interval (every 30 seconds)
+  useEffect(() => {
+    const interval = setInterval(() => {
+       const dueTasks = checkDueTasks();
+       if (dueTasks.length > 0) {
+         // Create a System/Bot message for the reminder
+         const reminderMessages = dueTasks.map(task => ({
+            id: generateId(),
+            role: Role.MODEL,
+            content: `⏰ **REMINDER:** Task "${task.title}" is due now! (Priority: ${task.priority})`,
+            timestamp: Date.now()
+         }));
+         
+         setMessages(prev => [...prev, ...reminderMessages]);
+         
+         // Auto speak reminder if voice mode is on
+         if (isVoiceMode) {
+            reminderMessages.forEach(msg => speakText(msg.content));
+         }
+       }
+    }, 30000);
+
+    return () => clearInterval(interval);
+  }, [isVoiceMode]);
+
+  // Auto-save session when messages change
+  useEffect(() => {
+    if (messages.length > 0 && currentSessionId) {
+      const title = messages[0].content.slice(0, 30) + (messages[0].content.length > 30 ? '...' : '');
+      const updatedSession: ChatSession = {
+        id: currentSessionId,
+        title: title || 'New Conversation',
+        messages: messages,
+        timestamp: Date.now()
+      };
+      
+      const updatedSessions = saveSession(updatedSession);
+      setSessions(updatedSessions);
+    }
+  }, [messages, currentSessionId]);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  const speakText = (text: string) => {
+    if (!text) return;
+    window.speechSynthesis.cancel();
+    
+    // Clean text for better speech
+    const cleanText = text.replace(/[*#`_\[\]]/g, '').replace(/https?:\/\/\S+/g, 'link');
+    
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    utterance.lang = 'ur-PK'; // Urdu Accent Preference
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const handleSendMessage = useCallback(async (content: string, attachment?: ChatAttachment) => {
+    // If no session is active, start one
+    if (!currentSessionId) {
+      const newSessionId = generateId();
+      setCurrentSessionId(newSessionId);
+    }
+
+    const userMessage: ChatMessage = {
+      id: generateId(),
+      role: Role.USER,
+      content,
+      timestamp: Date.now(),
+      attachment // Store the attachment
+    };
+
+    // Add user message immediately
+    setMessages(prev => [...prev, userMessage]);
+    setIsLoading(true);
+
+    // Placeholder for bot message
+    const botMessageId = generateId();
+    const botPlaceholder: ChatMessage = {
+      id: botMessageId,
+      role: Role.MODEL,
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+      generatedImages: []
+    };
+
+    setMessages(prev => [...prev, botPlaceholder]);
+
+    try {
+      let streamText = "";
+      
+      await streamGeminiResponse(
+        currentModelId,
+        messages, // Pass history up to this point
+        content,
+        (chunkText) => {
+          streamText += chunkText;
+          setMessages(prev => 
+            prev.map(msg => 
+              msg.id === botMessageId 
+                ? { ...msg, content: streamText } 
+                : msg
+            )
+          );
+        },
+        attachment, // Pass attachment to service
+        user?.name, // Pass user name for personalization
+        (base64Image) => {
+          // Callback for when an image is generated by the tool
+          setMessages(prev => 
+            prev.map(msg => 
+              msg.id === botMessageId 
+                ? { 
+                    ...msg, 
+                    generatedImages: [...(msg.generatedImages || []), base64Image] 
+                  } 
+                : msg
+            )
+          );
+        }
+      );
+
+      // Finalize message
+      setMessages(prev => 
+        prev.map(msg => 
+          msg.id === botMessageId 
+            ? { ...msg, isStreaming: false, content: streamText } 
+            : msg
+        )
+      );
+
+      // Auto-speak if Voice Mode is active
+      if (isVoiceMode) {
+        speakText(streamText);
+      }
+
+    } catch (error) {
+      console.error("Failed to generate response", error);
+      setMessages(prev => 
+        prev.map(msg => 
+          msg.id === botMessageId 
+            ? { ...msg, isStreaming: false, isError: true, content: "Sorry, I encountered an error. Please try again." } 
+            : msg
+        )
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  }, [messages, currentModelId, user, currentSessionId, isVoiceMode]);
+
+  const handleClearChat = () => {
+    window.speechSynthesis.cancel(); // Stop any speaking
+    setMessages([]);
+    setCurrentSessionId(null);
+    setIsLoading(false);
+    setIsSidebarOpen(false); // Close sidebar on mobile
+  };
+
+  const handleNewChat = () => {
+    handleClearChat(); // Use the robust clear logic
+  };
+
+  const handleSelectSession = (session: ChatSession) => {
+    setMessages(session.messages);
+    setCurrentSessionId(session.id);
+  };
+
+  const handleDeleteSession = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    const updatedSessions = deleteSession(id);
+    setSessions(updatedSessions);
+    
+    // If we deleted the current session, reset view
+    if (currentSessionId === id) {
+      handleNewChat();
+    }
+  };
+
+  const handleLogin = () => {
+    // Simulate Google Login for demonstration
+    const mockUser: UserProfile = {
+      name: 'Mumtaz',
+      email: 'mumtaz@gmail.com',
+      picture: 'https://ui-avatars.com/api/?name=Mumtaz&background=random'
+    };
+    setUser(mockUser);
+    
+    // Automatically save name to memory on login
+    saveMemory('name', mockUser.name);
+  };
+
+  const handleLogout = () => {
+    setUser(undefined);
+    handleNewChat(); // Clear chat on logout
+  };
+
+  return (
+    <div className="flex h-screen bg-background overflow-hidden relative">
+      
+      {/* Sidebar */}
+      <Sidebar 
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
+        currentModelId={currentModelId}
+        onModelChange={setCurrentModelId}
+        onNewChat={handleNewChat}
+        user={user}
+        onLogin={handleLogin}
+        onLogout={handleLogout}
+        sessions={sessions}
+        currentSessionId={currentSessionId}
+        onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
+      />
+
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col h-full relative min-w-0">
+        
+        {/* Mobile Header */}
+        <header className="md:hidden flex items-center p-4 border-b border-slate-800 bg-slate-900/80 backdrop-blur z-30">
+          <button 
+            onClick={() => setIsSidebarOpen(true)}
+            className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg"
+          >
+            <Menu size={24} />
+          </button>
+          <span className="ml-3 font-semibold text-slate-200">SochBot</span>
+          <div className="ml-auto flex items-center gap-2">
+             <button
+               onClick={() => setIsVoiceMode(!isVoiceMode)}
+               className={`p-2 rounded-lg transition-colors ${isVoiceMode ? 'bg-indigo-500/20 text-indigo-400' : 'text-slate-400'}`}
+             >
+                {isVoiceMode ? <Volume2 size={20} /> : <VolumeX size={20} />}
+             </button>
+             <button
+                onClick={handleClearChat}
+                className="p-2 bg-slate-800 text-slate-400 hover:text-red-400 hover:bg-red-900/20 rounded-lg transition-colors text-xs font-semibold"
+              >
+                Clear
+             </button>
+          </div>
+        </header>
+
+        {/* Desktop Header / Controls */}
+        <div className="hidden md:flex absolute top-4 right-6 z-30 items-center gap-3">
+            {/* Voice Mode Toggle */}
+            <button
+               onClick={() => setIsVoiceMode(!isVoiceMode)}
+               className={`
+                  flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-all text-xs font-medium backdrop-blur-sm
+                  ${isVoiceMode 
+                    ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300' 
+                    : 'bg-slate-800/50 border-slate-700/50 text-slate-400 hover:text-slate-200'
+                  }
+               `}
+               title="Toggle Auto Text-to-Speech"
+            >
+               {isVoiceMode ? <Volume2 size={14} /> : <VolumeX size={14} />}
+               <span>{isVoiceMode ? 'Voice Mode: ON' : 'Voice Mode: OFF'}</span>
+            </button>
+
+            <button
+              onClick={handleClearChat}
+              className="px-3 py-1.5 bg-slate-800/50 border border-slate-700/50 text-slate-400 hover:text-red-400 hover:border-red-500/30 rounded-lg transition-all text-xs font-medium backdrop-blur-sm"
+            >
+              Clear Chat
+            </button>
+        </div>
+
+        {/* Chat Area */}
+        <div className="flex-1 overflow-y-auto p-4 md:p-6 scroll-smooth">
+          {messages.length === 0 ? (
+             <div className="h-full flex flex-col items-center justify-center text-center p-8 opacity-50">
+                <div className="w-20 h-20 bg-slate-800 rounded-2xl flex items-center justify-center mb-6 shadow-2xl shadow-blue-900/20">
+                    <span className="text-4xl">🚀</span>
+                </div>
+                <h2 className="text-2xl md:text-3xl font-bold text-slate-200 mb-2">
+                  Hello {user ? user.name : 'there'}! I am SochBot.
+                </h2>
+                <p className="text-slate-500 max-w-md">
+                  I can analyze <b>Competitors</b>, build Websites, generate Business Ideas, manage <b>Tasks</b>, and create <b>Ultra-Fast Images</b>!
+                </p>
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-3">
+                   <div className="flex items-center gap-2 text-indigo-400 bg-indigo-500/10 px-4 py-2 rounded-full border border-indigo-500/20">
+                      <Volume2 size={16} />
+                      <span className="text-sm font-medium">Try Voice Mode</span>
+                   </div>
+                </div>
+             </div>
+          ) : (
+            <div className="max-w-4xl mx-auto pb-4">
+              {messages.map((msg) => (
+                <ChatBubble key={msg.id} message={msg} />
+              ))}
+              <div ref={messagesEndRef} />
+            </div>
+          )}
+        </div>
+
+        {/* Input Area */}
+        <div className="z-20 bg-gradient-to-t from-background via-background to-transparent pt-10 pb-2">
+           <ChatInput 
+             onSend={handleSendMessage} 
+             isLoading={isLoading} 
+           />
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default App;
